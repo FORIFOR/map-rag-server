@@ -76,31 +76,10 @@ class MCPServer:
         """
         self.logger.info(f"MCPサーバー '{server_name}' を起動しました")
 
-        # サーバー情報を出力
-        self._send_response(
-            {
-                "jsonrpc": "2.0",
-                "method": "server/info",
-                "params": {
-                    "name": server_name,
-                    "version": version,
-                    "description": description,
-                    "tools": self._get_tools(),
-                    "resources": self._get_resources(),
-                },
-            }
-        )
-
-        # ツール情報を出力
-        self._send_response(
-            {
-                "jsonrpc": "2.0",
-                "method": "tools/list",
-                "params": {
-                    "tools": self._get_tools(),
-                },
-            }
-        )
+        # サーバー情報を保存（initializeリクエストで使用）
+        self.server_name = server_name
+        self.server_version = version
+        self.server_description = description
 
         # リクエストをリッスン
         while True:
@@ -179,31 +158,25 @@ class MCPServer:
             request_id: リクエストID
         """
         # クライアント情報を取得（オプション）
-        client_name = params.get("client_name", "unknown")
-        client_version = params.get("client_version", "unknown")
+        client_name = params.get("clientInfo", {}).get("name", "unknown")
+        client_version = params.get("clientInfo", {}).get("version", "unknown")
 
         self.logger.info(f"クライアント '{client_name} {client_version}' が接続しました")
 
         # サーバーの機能を返す
         response = {
             "protocolVersion": "2024-11-05",
-            "serverInfo": {"name": "mcp-server-python", "version": "0.1.0", "description": "Python MCP Server"},
-            "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False, "subscribe": False}},
-            "instructions": "Python MCPサーバーを使用する際の注意点:\n1. 各ツールの入力パラメータを確認してください。\n2. エラーが発生した場合はログを確認してください。",
+            "serverInfo": {
+                "name": getattr(self, "server_name", "mcp-server-python"),
+                "version": getattr(self, "server_version", "0.1.0"),
+            },
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+            },
         }
 
         self._send_result(response, request_id)
-
-        # ツール情報を送信
-        self._send_response(
-            {
-                "jsonrpc": "2.0",
-                "method": "tools/list",
-                "params": {
-                    "tools": self._get_tools(),
-                },
-            }
-        )
 
     def _send_result(self, result: Any, request_id: Any):
         """
