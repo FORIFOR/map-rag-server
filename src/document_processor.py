@@ -8,11 +8,12 @@ import logging
 import os
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterable, Tuple
 import hashlib
 import time
 
 import markitdown
+from pypdf import PdfReader
 
 
 class DocumentProcessor:
@@ -231,58 +232,79 @@ class DocumentProcessor:
         except Exception as e:
             self.logger.error(f"ファイルレジストリの保存に失敗しました: {str(e)}")
 
+    def _determine_suffix(self, file_path: Path) -> Tuple[str, str]:
+        """
+        ファイル名とディレクトリサフィックスを計算するヘルパー
+        """
+        try:
+            relative_path = file_path.relative_to(Path(file_path.parts[0]) / Path(file_path.parts[1]))
+            parent_dirs = relative_path.parent.parts
+            dir_suffix = "_".join(parent_dirs) if parent_dirs else ""
+        except ValueError:
+            dir_suffix = ""
+        processed_file_name = f"{file_path.stem}{('_' + dir_suffix) if dir_suffix else ''}.md"
+        return processed_file_name, dir_suffix
+
+    def _ensure_processed_file(self, processed_dir: str, processed_file_name: str, content: str) -> Path:
+        """
+        処理済みテキストを保存してパスを返す
+        """
+        processed_file_path = Path(processed_dir) / processed_file_name
+        os.makedirs(Path(processed_dir), exist_ok=True)
+        with open(processed_file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self.logger.info(f"処理済みファイルを保存しました: {processed_file_path}")
+        return processed_file_path
+
+    def _iter_pdf_pages(self, file_path: str) -> Iterable[Tuple[int, str]]:
+        """
+        PDF からページ単位でテキストを抽出する
+        """
+        reader = PdfReader(file_path)
+        for index, page in enumerate(reader.pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception as exc:
+                self.logger.warning(f"PDFページ抽出に失敗しました (page={index}, file={file_path}): {exc}")
+                text = ""
+            yield index, text
+
     def process_file(
         self, file_path: str, processed_dir: str, chunk_size: int = 500, overlap: int = 100
     ) -> List[Dict[str, Any]]:
         """
         ファイルを処理します。
-
-        Args:
-            file_path: ファイルのパス
-            processed_dir: 処理済みファイルを保存するディレクトリのパス
-            chunk_size: チャンクサイズ（文字数）
-            overlap: チャンク間のオーバーラップ（文字数）
-
-        Returns:
-            処理結果のリスト（各要素はチャンク情報を含む辞書）
         """
         try:
-            # ファイルを読み込む
+            file_path_obj = Path(file_path)
+            processed_file_name, dir_suffix = self._determine_suffix(file_path_obj)
+
+            # ファイルの種類に応じて処理
+            ext = file_path_obj.suffix.lower()
+            if ext in self.SUPPORTED_EXTENSIONS["pdf"]:
+                markdown_content = self.read_file(file_path)
+                processed_file_path = self._ensure_processed_file(processed_dir, processed_file_name, markdown_content)
+                return self._process_pdf_chunks(
+                    file_path=file_path,
+                    processed_file_path=processed_file_path,
+                    dir_suffix=dir_suffix,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                )
+
+            # その他のファイル
             content = self.read_file(file_path)
             if not content:
                 return []
 
-            # ファイルパスからディレクトリ構造を取得
-            file_path_obj = Path(file_path)
-            relative_path = file_path_obj.relative_to(Path(file_path_obj.parts[0]) / Path(file_path_obj.parts[1]))
-            parent_dirs = relative_path.parent.parts
-
-            # ディレクトリ名をサフィックスとして使用
-            dir_suffix = "_".join(parent_dirs) if parent_dirs else ""
-
-            # 処理済みファイル名を生成
-            processed_file_name = f"{file_path_obj.stem}{('_' + dir_suffix) if dir_suffix else ''}.md"
-            processed_file_path = Path(processed_dir) / processed_file_name
-
-            # 処理済みディレクトリが存在しない場合は作成
-            os.makedirs(Path(processed_dir), exist_ok=True)
-
-            # 処理済みファイルに書き込む
-            with open(processed_file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            self.logger.info(f"処理済みファイルを保存しました: {processed_file_path}")
-
-            # チャンクに分割
+            processed_file_path = self._ensure_processed_file(processed_dir, processed_file_name, content)
             chunks = self.split_into_chunks(content, chunk_size, overlap)
 
-            # 結果を作成
-            results = []
+            results: List[Dict[str, Any]] = []
             for i, chunk in enumerate(chunks):
-                document_id = f"{processed_file_name}_{i}"
                 results.append(
                     {
-                        "document_id": document_id,
+                        "document_id": f"{processed_file_name}_{i}",
                         "content": chunk,
                         "file_path": str(processed_file_path),
                         "original_file_path": file_path,
@@ -291,6 +313,10 @@ class DocumentProcessor:
                             "file_name": file_path_obj.name,
                             "directory": str(file_path_obj.parent),
                             "directory_suffix": dir_suffix,
+                            "page": 1,
+                            "source_uri": os.path.abspath(file_path),
+                            "txt_uri": str(processed_file_path),
+                            "offsets": None,
                         },
                     }
                 )
@@ -301,6 +327,52 @@ class DocumentProcessor:
         except Exception as e:
             self.logger.error(f"ファイル '{file_path}' の処理中にエラーが発生しました: {str(e)}")
             raise
+
+    def _process_pdf_chunks(
+        self,
+        file_path: str,
+        processed_file_path: Path,
+        dir_suffix: str,
+        chunk_size: int,
+        overlap: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        PDF をページ単位でチャンク化し、ページ情報をメタデータに含める
+        """
+        results: List[Dict[str, Any]] = []
+        file_path_obj = Path(file_path)
+        processed_file_name = processed_file_path.name
+        chunk_counter = 0
+
+        for page_no, page_text in self._iter_pdf_pages(file_path):
+            if not page_text:
+                continue
+            page_chunks = self.split_into_chunks(page_text, chunk_size, overlap)
+            for chunk in page_chunks:
+                results.append(
+                    {
+                        "document_id": f"{processed_file_name}_{chunk_counter}",
+                        "content": chunk,
+                        "file_path": str(processed_file_path),
+                        "original_file_path": file_path,
+                        "chunk_index": chunk_counter,
+                        "metadata": {
+                            "file_name": file_path_obj.name,
+                            "directory": str(file_path_obj.parent),
+                            "directory_suffix": dir_suffix,
+                            "page": page_no,
+                            "source_uri": os.path.abspath(file_path),
+                            "txt_uri": str(processed_file_path),
+                            "offsets": None,
+                        },
+                    }
+                )
+                chunk_counter += 1
+
+        if not results:
+            self.logger.warning(f"PDF '{file_path}' からテキストが抽出できませんでした。")
+
+        return results
 
     def process_directory(
         self, source_dir: str, processed_dir: str, chunk_size: int = 500, overlap: int = 100, incremental: bool = False

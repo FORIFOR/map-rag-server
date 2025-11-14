@@ -9,7 +9,7 @@ import psycopg2
 import json
 import os
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 
 # .envの読み込み
 load_dotenv()
@@ -96,14 +96,30 @@ class VectorDatabase:
                 CREATE TABLE IF NOT EXISTS documents (
                     id SERIAL PRIMARY KEY,
                     document_id TEXT UNIQUE NOT NULL,
+                    tenant TEXT NOT NULL DEFAULT 'default',
+                    notebook TEXT NOT NULL DEFAULT '',
+                    doc_base_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
                     content TEXT NOT NULL,
                     file_path TEXT NOT NULL,
                     chunk_index INTEGER NOT NULL,
                     metadata JSONB,
                     embedding vector({EMBEDDING_DIM}),
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    notebook_id TEXT NOT NULL DEFAULT 'default',
+                    is_global BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # 既存テーブルに不足するカラムを追加
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS notebook TEXT NOT NULL DEFAULT '';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS doc_base_id TEXT NOT NULL DEFAULT '';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS notebook_id TEXT NOT NULL DEFAULT 'default';")
+            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_global BOOLEAN NOT NULL DEFAULT FALSE;")
 
             # インデックスの作成
             cursor.execute("""
@@ -113,8 +129,24 @@ class VectorDatabase:
                 CREATE INDEX IF NOT EXISTS idx_documents_file_path ON documents (file_path);
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_documents_embedding ON documents USING ivfflat (embedding vector_cosine_ops);
+                CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents (tenant);
             """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_tenant_notebook ON documents (tenant, notebook);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_tenant_doc ON documents (tenant, doc_base_id);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_scope ON documents (user_id, notebook_id);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_global ON documents (is_global);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_embedding ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+            """)
+            cursor.execute("ANALYZE documents;")
 
             # コミット
             self.connection.commit()
@@ -140,6 +172,14 @@ class VectorDatabase:
         chunk_index: int,
         embedding: List[float],
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        tenant: str = "default",
+        notebook: str = "",
+        doc_base_id: str = "",
+        title: str = "",
+        user_id: str = "default",
+        notebook_id: str = "default",
+        is_global: bool = False,
     ) -> None:
         """
         ドキュメントを挿入します。
@@ -169,18 +209,39 @@ class VectorDatabase:
             # ドキュメントの挿入
             cursor.execute(
                 """
-                INSERT INTO documents (document_id, content, file_path, chunk_index, embedding, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO documents (document_id, tenant, notebook, doc_base_id, title, content, file_path, chunk_index, embedding, metadata, user_id, notebook_id, is_global)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (document_id) 
                 DO UPDATE SET 
+                    tenant = EXCLUDED.tenant,
+                    notebook = EXCLUDED.notebook,
+                    doc_base_id = EXCLUDED.doc_base_id,
+                    title = EXCLUDED.title,
                     content = EXCLUDED.content,
                     file_path = EXCLUDED.file_path,
                     chunk_index = EXCLUDED.chunk_index,
                     embedding = EXCLUDED.embedding,
                     metadata = EXCLUDED.metadata,
+                    user_id = EXCLUDED.user_id,
+                    notebook_id = EXCLUDED.notebook_id,
+                    is_global = EXCLUDED.is_global,
                     created_at = CURRENT_TIMESTAMP;
             """,
-                (document_id, content, file_path, chunk_index, embedding, metadata_json),
+                (
+                    document_id,
+                    tenant,
+                    notebook,
+                    doc_base_id,
+                    title,
+                    content,
+                    file_path,
+                    chunk_index,
+                    embedding,
+                    metadata_json,
+                    user_id,
+                    notebook_id,
+                    bool(is_global),
+                ),
             )
 
             # コミット
@@ -233,21 +294,41 @@ class VectorDatabase:
             for doc in documents:
                 metadata_json = json.dumps(doc.get("metadata")) if doc.get("metadata") else None
                 values.append(
-                    (doc["document_id"], doc["content"], doc["file_path"], doc["chunk_index"], doc["embedding"], metadata_json)
+                    (
+                        doc["document_id"],
+                        doc.get("tenant", "default"),
+                        doc.get("notebook", ""),
+                        doc.get("doc_base_id", ""),
+                        doc.get("title", doc.get("metadata", {}).get("file_name", "")),
+                        doc["content"],
+                        doc["file_path"],
+                        doc["chunk_index"],
+                        doc["embedding"],
+                        metadata_json,
+                        doc.get("user_id", doc.get("tenant", "default")),
+                        doc.get("notebook_id", doc.get("notebook", "default")),
+                        bool(doc.get("is_global", False)),
+                    )
                 )
 
-            # バッチ挿入
             cursor.executemany(
                 """
-                INSERT INTO documents (document_id, content, file_path, chunk_index, embedding, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO documents (document_id, tenant, notebook, doc_base_id, title, content, file_path, chunk_index, embedding, metadata, user_id, notebook_id, is_global)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (document_id) 
                 DO UPDATE SET 
+                    tenant = EXCLUDED.tenant,
+                    notebook = EXCLUDED.notebook,
+                    doc_base_id = EXCLUDED.doc_base_id,
+                    title = EXCLUDED.title,
                     content = EXCLUDED.content,
                     file_path = EXCLUDED.file_path,
                     chunk_index = EXCLUDED.chunk_index,
                     embedding = EXCLUDED.embedding,
                     metadata = EXCLUDED.metadata,
+                    user_id = EXCLUDED.user_id,
+                    notebook_id = EXCLUDED.notebook_id,
+                    is_global = EXCLUDED.is_global,
                     created_at = CURRENT_TIMESTAMP;
             """,
                 values,
@@ -269,7 +350,17 @@ class VectorDatabase:
             if "cursor" in locals() and cursor:
                 cursor.close()
 
-    def search(self, query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query_embedding: List[float],
+        limit: int = 5,
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        doc_filter: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+        include_global: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         ベクトル検索を行います。
 
@@ -296,30 +387,86 @@ class VectorDatabase:
             embedding_array = f"ARRAY{embedding_str}::vector"
 
             # ベクトル検索
-            cursor.execute(
-                f"""
+            where_clauses = ["embedding IS NOT NULL"]
+            params: List[Any] = []
+            scope_user = (user_id or "").strip()
+            scope_notebook = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook:
+                raise ValueError("user_id と notebook_id は必須です")
+            if tenant:
+                where_clauses.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                where_clauses.append("notebook = %s")
+                params.append(notebook)
+            scope_clause = "(user_id = %s AND notebook_id = %s)"
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            where_clauses.append(scope_clause)
+            params.extend([scope_user, scope_notebook])
+            if doc_filter:
+                safe_filter = doc_filter
+                prefix = None
+                if tenant and notebook:
+                    prefix = f"{tenant}:{notebook}:"
+                elif tenant:
+                    prefix = f"{tenant}:"
+                if prefix:
+                    safe_filter = [d for d in doc_filter if isinstance(d, str) and d.startswith(prefix)]
+                else:
+                    safe_filter = []
+                if safe_filter:
+                    placeholders = ", ".join(["%s"] * len(safe_filter))
+                    where_clauses.append(f"doc_base_id IN ({placeholders})")
+                    params.extend(safe_filter)
+
+            where_sql = " AND ".join(where_clauses)
+
+            query = f"""
                 SELECT
                     document_id,
+                    tenant,
+                    notebook,
+                    doc_base_id,
+                    title,
                     content,
                     file_path,
                     chunk_index,
                     metadata,
+                    user_id,
+                    notebook_id,
+                    is_global,
                     1 - (embedding <=> {embedding_array}) AS similarity
                 FROM
                     documents
                 WHERE
-                    embedding IS NOT NULL
+                    {where_sql}
                 ORDER BY
                     embedding <=> {embedding_array}
                 LIMIT %s;
-                """,
-                (limit,),
-            )
+            """
+
+            params.append(limit)
+            cursor.execute(query, params)
 
             # 結果の取得
             results = []
             for row in cursor.fetchall():
-                document_id, content, file_path, chunk_index, metadata_json, similarity = row
+                (
+                    document_id,
+                    row_tenant,
+                    row_notebook,
+                    doc_base_id,
+                    title,
+                    content,
+                    file_path,
+                    chunk_index,
+                    metadata_json,
+                    row_user_id,
+                    row_notebook_id,
+                    row_is_global,
+                    similarity,
+                ) = row
 
                 # メタデータをJSONからデコード
                 if metadata_json:
@@ -337,10 +484,17 @@ class VectorDatabase:
                 results.append(
                     {
                         "document_id": document_id,
+                        "tenant": row_tenant,
+                        "notebook": row_notebook,
+                        "doc_base_id": doc_base_id,
+                        "title": title,
                         "content": content,
                         "file_path": file_path,
                         "chunk_index": chunk_index,
                         "metadata": metadata,
+                        "user_id": row_user_id,
+                        "notebook_id": row_notebook_id,
+                        "is_global": bool(row_is_global),
                         "similarity": similarity,
                     }
                 )
@@ -498,7 +652,15 @@ class VectorDatabase:
             if "cursor" in locals() and cursor:
                 cursor.close()
 
-    def get_document_count(self) -> int:
+    def get_document_count(
+        self,
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        *,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+        include_global: bool = False,
+    ) -> int:
         """
         データベース内のドキュメント数を取得します。
 
@@ -517,7 +679,26 @@ class VectorDatabase:
             cursor = self.connection.cursor()
 
             # ドキュメント数を取得
-            cursor.execute("SELECT COUNT(*) FROM documents;")
+            where = []
+            params: List[Any] = []
+            if tenant:
+                where.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                where.append("notebook = %s")
+                params.append(notebook)
+            scope_user = (user_id or "").strip()
+            scope_notebook = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook:
+                raise ValueError("user_id と notebook_id は必須です")
+            scope_clause = "(user_id = %s AND notebook_id = %s)"
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            where.append(scope_clause)
+            params.extend([scope_user, scope_notebook])
+
+            where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+            cursor.execute(f"SELECT COUNT(*) FROM documents {where_sql};", params)
             count = cursor.fetchone()[0]
 
             self.logger.info(f"データベース内のドキュメント数: {count}")
@@ -531,6 +712,385 @@ class VectorDatabase:
         except Exception as e:
             self.logger.error(f"ドキュメント数の取得中にエラーが発生しました: {str(e)}")
             raise
+
+    def list_documents(
+        self,
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        *,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+        include_global: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        ドキュメント一覧を返します（ファイル単位で集約）。
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            cursor = self.connection.cursor()
+            params: List[Any] = []
+            clauses: List[str] = []
+            if tenant:
+                clauses.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                clauses.append("notebook = %s")
+                params.append(notebook)
+            scope_user = (user_id or "").strip()
+            scope_notebook = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook:
+                raise ValueError("user_id と notebook_id は必須です")
+            scope_clause = "(user_id = %s AND notebook_id = %s)"
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            clauses.append(scope_clause)
+            params.extend([scope_user, scope_notebook])
+
+            where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+            cursor.execute(
+                f"""
+                SELECT
+                    tenant,
+                    notebook,
+                    MAX(user_id) AS user_id,
+                    MAX(notebook_id) AS notebook_id,
+                    BOOL_OR(is_global) AS is_global,
+                    doc_base_id,
+                    COALESCE(NULLIF(MAX(title), ''), doc_base_id) AS title,
+                    COUNT(*) AS chunks,
+                    MAX(EXTRACT(EPOCH FROM created_at))::BIGINT AS last_updated,
+                    MAX(COALESCE(metadata->>'source_file_path', '')) AS source_file_path
+                FROM documents
+                {where_clause}
+                GROUP BY tenant, notebook, doc_base_id
+                ORDER BY title;
+                """,
+                params,
+            )
+
+            results = []
+            for row in cursor.fetchall():
+                row_tenant, row_notebook, row_user_id, row_nb_id, row_is_global, doc_base_id, title, chunks, last_updated, source_file_path = row
+                results.append(
+                    {
+                        "tenant": row_tenant,
+                        "notebook": row_notebook,
+                        "user_id": row_user_id,
+                        "notebook_id": row_nb_id,
+                        "is_global": bool(row_is_global),
+                        "doc_id": doc_base_id,
+                        "title": title,
+                        "chunks": int(chunks),
+                        "last_updated": int(last_updated) if last_updated is not None else None,
+                        "source_file_path": source_file_path,
+                    }
+                )
+
+            return results
+        except Exception as e:
+            self.logger.error(f"ドキュメント一覧の取得中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def list_notebook_summaries(
+        self,
+        *,
+        user_id: str,
+        tenant: Optional[str] = None,
+        include_global: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        ノートブックごとの集計情報を返します。
+
+        Args:
+            user_id: 対象ユーザー
+            tenant: フィルタするテナント（省略可）
+            include_global: グローバル資料を含めるかどうか
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            scope_user = (user_id or "").strip()
+            if not scope_user:
+                raise ValueError("user_id は必須です")
+
+            cursor = self.connection.cursor()
+            clauses: List[str] = ["notebook_id IS NOT NULL", "notebook_id <> ''"]
+            params: List[Any] = []
+
+            if tenant:
+                clauses.append("tenant = %s")
+                params.append(tenant)
+
+            scope_clause = "user_id = %s"
+            params.append(scope_user)
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            clauses.append(scope_clause)
+
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+            cursor.execute(
+                f"""
+                SELECT
+                    notebook_id,
+                    COALESCE(NULLIF(MAX(title), ''), notebook_id) AS title,
+                    COUNT(DISTINCT doc_base_id) AS sources,
+                    MAX(EXTRACT(EPOCH FROM created_at))::BIGINT AS updated_ts
+                FROM documents
+                {where_sql}
+                GROUP BY notebook_id
+                ORDER BY updated_ts DESC NULLS LAST, notebook_id;
+                """,
+                params,
+            )
+
+            summaries: List[Dict[str, Any]] = []
+            for row in cursor.fetchall():
+                notebook_id, title, sources, updated_ts = row
+                summaries.append(
+                    {
+                        "notebook_id": notebook_id,
+                        "title": title,
+                        "sources": int(sources),
+                        "updated_at": float(updated_ts) if updated_ts is not None else None,
+                    }
+                )
+
+            return summaries
+        except Exception as e:
+            self.logger.error(f"ノートブック集計の取得中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def delete_document_by_base_id(self, tenant: str, notebook: str, doc_base_id: str) -> int:
+        """
+        テナント＋doc_base_id でドキュメントを削除します。
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "DELETE FROM documents WHERE tenant = %s AND notebook = %s AND doc_base_id = %s;",
+                (tenant, notebook, doc_base_id),
+            )
+            deleted_rows = cursor.rowcount
+            self.connection.commit()
+            self.logger.info(f"tenant={tenant} notebook={notebook} doc={doc_base_id} を削除しました（{deleted_rows}件）")
+            return deleted_rows
+        except Exception as e:
+            if self.connection:
+                self.connection.rollback()
+            self.logger.error(f"ドキュメント削除中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def delete_documents_by_tenant(self, tenant: str, notebook: Optional[str] = None) -> int:
+        """
+        指定テナントのドキュメントを全削除します。
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            cursor = self.connection.cursor()
+            if notebook:
+                cursor.execute("DELETE FROM documents WHERE tenant = %s AND notebook = %s;", (tenant, notebook))
+            else:
+                cursor.execute("DELETE FROM documents WHERE tenant = %s;", (tenant,))
+            deleted_rows = cursor.rowcount
+            self.connection.commit()
+            if notebook:
+                self.logger.info(f"tenant={tenant} notebook={notebook} のドキュメントを削除しました（{deleted_rows}件）")
+            else:
+                self.logger.info(f"tenant={tenant} のドキュメントを削除しました（{deleted_rows}件）")
+            return deleted_rows
+        except Exception as e:
+            if self.connection:
+                self.connection.rollback()
+            self.logger.error(f"テナント削除中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def delete_documents_by_scope(
+        self,
+        *,
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        user_id: str,
+        notebook_id: str,
+    ) -> int:
+        """
+        指定ユーザーのノートブックに紐づくドキュメントを削除します。
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            scope_user = (user_id or "").strip()
+            scope_notebook_id = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook_id:
+                raise ValueError("user_id と notebook_id は必須です")
+
+            cursor = self.connection.cursor()
+
+            clauses: List[str] = ["user_id = %s", "notebook_id = %s"]
+            params: List[Any] = [scope_user, scope_notebook_id]
+
+            if tenant:
+                clauses.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                clauses.append("notebook = %s")
+                params.append(notebook)
+
+            where_clause = " AND ".join(clauses)
+            cursor.execute(f"DELETE FROM documents WHERE {where_clause};", params)
+            deleted_rows = cursor.rowcount
+            self.connection.commit()
+            self.logger.info(
+                "ユーザー %s のノートブック %s を削除しました（%d 件）",
+                scope_user,
+                scope_notebook_id,
+                deleted_rows,
+            )
+            return deleted_rows
+        except Exception as e:
+            if self.connection:
+                self.connection.rollback()
+            self.logger.error(f"ノートブック削除中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def migrate_default_scope_to_library(self) -> int:
+        """
+        旧来の default/default スコープに残っている行を library グローバル棚へ移動する。
+        Returns:
+            移動した行数
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                UPDATE documents
+                   SET notebook_id = 'library',
+                       is_global = TRUE
+                 WHERE user_id = 'default'
+                   AND notebook_id = 'default';
+                """
+            )
+            moved = cursor.rowcount
+            if moved:
+                self.connection.commit()
+                self.logger.info(f"defaultスコープからlibraryへ {moved} 件のドキュメントを移動しました")
+            else:
+                self.connection.rollback()
+            return moved
+        except Exception as e:
+            if self.connection:
+                self.connection.rollback()
+            self.logger.error(f"defaultスコープからの移行に失敗しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def get_document_metadata(
+        self,
+        tenant: str,
+        notebook: str,
+        doc_base_id: str,
+        *,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        ドキュメントの代表的なメタデータを1件返します。
+        """
+        try:
+            if not self.connection:
+                self.connect()
+
+            cursor = self.connection.cursor()
+            scope_user = (user_id or "").strip()
+            scope_notebook = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook:
+                raise ValueError("user_id と notebook_id は必須です")
+
+            base_params = [tenant, notebook, doc_base_id, scope_user, scope_notebook]
+            where_clause = "tenant = %s AND notebook = %s AND doc_base_id = %s AND user_id = %s AND notebook_id = %s"
+            cursor.execute(
+                f"""
+                SELECT title, metadata
+                  FROM documents
+                 WHERE {where_clause}
+                 ORDER BY created_at DESC
+                 LIMIT 1;
+                """,
+                base_params,
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            title, metadata_json = row
+            metadata = metadata_json if isinstance(metadata_json, dict) else (json.loads(metadata_json) if metadata_json else {})
+
+            # ページ数などの統計を取得
+            cursor.execute(
+                f"""
+                SELECT
+                    COUNT(DISTINCT (metadata->>'page')) FILTER (WHERE metadata ? 'page') AS page_count,
+                    MAX(metadata->>'source_file_path') AS source_file_path,
+                    MAX(metadata->>'processed_file_path') AS processed_file_path,
+                    MAX(metadata->>'source_uri') AS source_uri,
+                    MAX(metadata->>'txt_uri') AS txt_uri
+                  FROM documents
+                 WHERE {where_clause};
+                """,
+                base_params,
+            )
+            stats_row = cursor.fetchone()
+            page_count = stats_row[0] if stats_row else None
+            source_file_path = stats_row[1] if stats_row else None
+            processed_file_path = stats_row[2] if stats_row else None
+            source_uri = stats_row[3] if stats_row else None
+            txt_uri = stats_row[4] if stats_row else None
+
+            metadata.setdefault("source_file_path", source_file_path)
+            metadata.setdefault("processed_file_path", processed_file_path)
+            metadata.setdefault("source_uri", source_uri)
+            metadata.setdefault("txt_uri", txt_uri)
+            metadata["title"] = title or metadata.get("file_name") or doc_base_id
+            metadata["doc_id"] = doc_base_id
+            metadata["tenant"] = tenant
+            metadata["notebook"] = notebook
+            metadata["page_count"] = page_count
+            return metadata
+        except Exception as e:
+            self.logger.error(f"ドキュメントメタデータ取得中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
 
     def get_adjacent_chunks(self, file_path: str, chunk_index: int, context_size: int = 1) -> List[Dict[str, Any]]:
         """
@@ -705,5 +1265,125 @@ class VectorDatabase:
 
         finally:
             # カーソルを閉じる
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def get_chunks_for_documents(
+        self,
+        *,
+        doc_ids: Sequence[str],
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+        include_global: bool = False,
+        max_chunks: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        指定した doc_base_id 群に紐づくチャンクをまとめて取得します。
+        """
+        doc_list = [doc_id.strip() for doc_id in doc_ids if doc_id and doc_id.strip()]
+        if not doc_list:
+            return []
+        try:
+            if not self.connection:
+                self.connect()
+
+            scope_user = (user_id or "").strip()
+            scope_notebook_id = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook_id:
+                raise ValueError("user_id と notebook_id は必須です")
+
+            cursor = self.connection.cursor()
+            placeholders = ", ".join(["%s"] * len(doc_list))
+            where_clauses = [f"doc_base_id IN ({placeholders})"]
+            params: List[Any] = list(doc_list)
+
+            if tenant:
+                where_clauses.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                where_clauses.append("notebook = %s")
+                params.append(notebook)
+
+            scope_clause = "(user_id = %s AND notebook_id = %s)"
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            where_clauses.append(scope_clause)
+            params.extend([scope_user, scope_notebook_id])
+
+            where_sql = " AND ".join(where_clauses)
+            query = f"""
+                SELECT
+                    tenant,
+                    notebook,
+                    doc_base_id,
+                    title,
+                    content,
+                    file_path,
+                    chunk_index,
+                    metadata,
+                    user_id,
+                    notebook_id,
+                    is_global
+                FROM documents
+                WHERE {where_sql}
+                ORDER BY doc_base_id, chunk_index
+            """
+            if max_chunks:
+                query += " LIMIT %s"
+                params.append(int(max_chunks))
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall() or []
+            results: List[Dict[str, Any]] = []
+            for row in rows:
+                (
+                    row_tenant,
+                    row_notebook,
+                    doc_base_id,
+                    title,
+                    content,
+                    file_path,
+                    chunk_index,
+                    metadata_json,
+                    row_user_id,
+                    row_nb_id,
+                    row_is_global,
+                ) = row
+
+                if metadata_json:
+                    if isinstance(metadata_json, str):
+                        try:
+                            metadata = json.loads(metadata_json)
+                        except json.JSONDecodeError:
+                            metadata = {}
+                    else:
+                        metadata = metadata_json
+                else:
+                    metadata = {}
+
+                results.append(
+                    {
+                        "tenant": row_tenant,
+                        "notebook": row_notebook,
+                        "doc_base_id": doc_base_id,
+                        "title": title,
+                        "content": content,
+                        "file_path": file_path,
+                        "chunk_index": chunk_index,
+                        "metadata": metadata,
+                        "user_id": row_user_id,
+                        "notebook_id": row_nb_id,
+                        "is_global": bool(row_is_global),
+                    }
+                )
+
+            self.logger.info("doc_base_id=%s のチャンクを %d 件取得しました", ",".join(doc_list[:5]), len(results))
+            return results
+        except Exception as e:
+            self.logger.error(f"doc_base_id 指定のチャンク取得中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
             if "cursor" in locals() and cursor:
                 cursor.close()

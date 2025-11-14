@@ -57,8 +57,34 @@ def register_rag_tools(server, rag_service: RAGService):
                     "description": "ドキュメント全体を取得するかどうか（デフォルト: false）",
                     "default": False,
                 },
+                "tenant": {
+                    "type": "string",
+                    "description": "テナントID（未指定時は環境変数TENANT_DEFAULT）",
+                },
+                "notebook": {
+                    "type": "string",
+                    "description": "ノートブックID（未指定時は環境変数NOTEBOOK_DEFAULTまたはデフォルト）",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "検索スコープとなるユーザーID（必須）",
+                },
+                "notebook_id": {
+                    "type": "string",
+                    "description": "検索スコープとなるノートブックID（必須）",
+                },
+                "include_global": {
+                    "type": "boolean",
+                    "description": "グローバル棚（library）を含める場合は true",
+                    "default": False,
+                },
+                "doc_filter": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "回答に利用するドキュメントIDを限定する場合に指定します",
+                },
             },
-            "required": ["query"],
+            "required": ["query", "user_id", "notebook_id"],
         },
         handler=lambda params: search_handler(params, rag_service),
     )
@@ -69,8 +95,30 @@ def register_rag_tools(server, rag_service: RAGService):
         description="インデックス内のドキュメント数を取得します",
         input_schema={
             "type": "object",
-            "properties": {},
-            "required": [],
+            "properties": {
+                "tenant": {
+                    "type": "string",
+                    "description": "テナントID（未指定時は環境変数TENANT_DEFAULT）",
+                },
+                "notebook": {
+                    "type": "string",
+                    "description": "ノートブックID（未指定時は環境変数NOTEBOOK_DEFAULTまたはデフォルト）",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "対象ユーザーID（必須）",
+                },
+                "notebook_id": {
+                    "type": "string",
+                    "description": "対象ノートブックID（必須）",
+                },
+                "include_global": {
+                    "type": "boolean",
+                    "description": "グローバル棚を含める場合は true",
+                    "default": False,
+                },
+            },
+            "required": ["user_id", "notebook_id"],
         },
         handler=lambda params: get_document_count_handler(params, rag_service),
     )
@@ -97,6 +145,46 @@ def search_handler(params: Dict[str, Any], rag_service: RAGService) -> Dict[str,
     with_context = params.get("with_context", True)
     context_size = params.get("context_size", 1)
     full_document = params.get("full_document", False)
+    tenant = params.get("tenant") or os.environ.get("TENANT_DEFAULT") or "default"
+    notebook = params.get("notebook") or os.environ.get("NOTEBOOK_DEFAULT") or "default"
+    doc_filter = params.get("doc_filter")
+    user_id = (
+        params.get("user_id")
+        or os.environ.get("RAG_USER_ID")
+        or os.environ.get("RAG_DEFAULT_USER")
+        or ""
+    ).strip()
+    notebook_id = (
+        params.get("notebook_id")
+        or os.environ.get("RAG_NOTEBOOK_ID")
+        or ""
+    ).strip()
+    include_global_raw = params.get("include_global", False)
+    if isinstance(include_global_raw, str):
+        include_global = include_global_raw.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        include_global = bool(include_global_raw)
+
+    if not user_id:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "エラー: user_id が指定されていません",
+                }
+            ],
+            "isError": True,
+        }
+    if not notebook_id:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "エラー: notebook_id が指定されていません",
+                }
+            ],
+            "isError": True,
+        }
 
     if not query:
         return {
@@ -111,7 +199,13 @@ def search_handler(params: Dict[str, Any], rag_service: RAGService) -> Dict[str,
 
     try:
         # ドキュメント数を確認
-        doc_count = rag_service.get_document_count()
+        doc_count = rag_service.get_document_count(
+            tenant,
+            notebook,
+            user_id=user_id,
+            notebook_id=notebook_id,
+            include_global=include_global,
+        )
         if doc_count == 0:
             return {
                 "content": [
@@ -124,7 +218,19 @@ def search_handler(params: Dict[str, Any], rag_service: RAGService) -> Dict[str,
             }
 
         # 検索を実行（前後のチャンクも取得、ドキュメント全体も取得）
-        results = rag_service.search(query, limit, with_context, context_size, full_document)
+        results = rag_service.search(
+            query,
+            limit,
+            with_context,
+            context_size,
+            full_document,
+            tenant=tenant,
+            notebook=notebook,
+            doc_filter=doc_filter,
+            user_id=user_id,
+            notebook_id=notebook_id,
+            include_global=include_global,
+        )
 
         if not results:
             return {
@@ -223,8 +329,35 @@ def get_document_count_handler(params: Dict[str, Any], rag_service: RAGService) 
         ドキュメント数
     """
     try:
-        # ドキュメント数を取得
-        count = rag_service.get_document_count()
+        tenant = params.get("tenant") or os.environ.get("TENANT_DEFAULT") or "default"
+        notebook = params.get("notebook") or os.environ.get("NOTEBOOK_DEFAULT") or "default"
+        user_id = (
+            params.get("user_id")
+            or os.environ.get("RAG_USER_ID")
+            or os.environ.get("RAG_DEFAULT_USER")
+            or ""
+        ).strip()
+        notebook_id = (
+            params.get("notebook_id")
+            or os.environ.get("RAG_NOTEBOOK_ID")
+            or ""
+        ).strip()
+        include_global_raw = params.get("include_global", False)
+        if isinstance(include_global_raw, str):
+            include_global = include_global_raw.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            include_global = bool(include_global_raw)
+
+        if not user_id or not notebook_id:
+            raise ValueError("user_id と notebook_id は必須です")
+
+        count = rag_service.get_document_count(
+            tenant,
+            notebook,
+            user_id=user_id,
+            notebook_id=notebook_id,
+            include_global=include_global,
+        )
 
         return {
             "content": [

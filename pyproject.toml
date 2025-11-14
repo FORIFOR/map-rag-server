@@ -28,6 +28,14 @@ dependencies = [
     "numpy",
     "markitdown[all]",
     "sentencepiece>=0.2.0",
+    "pypdf",
+    "pymupdf>=1.23",
+    "pdfplumber",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "httpx",
+    "regex>=2023.10.3",
 ]
 
 [project.optional-dependencies]

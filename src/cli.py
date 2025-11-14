@@ -10,6 +10,7 @@ import os
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 from .rag_tools import create_rag_service_from_env
@@ -34,7 +35,7 @@ def setup_logging():
     return logging.getLogger("cli")
 
 
-def clear_index():
+def clear_index(tenant: Optional[str] = None, notebook: Optional[str] = None):
     """
     インデックスをクリアする
     """
@@ -48,18 +49,32 @@ def clear_index():
     rag_service = create_rag_service_from_env()
 
     # 処理済みディレクトリのパス
-    processed_dir = os.environ.get("PROCESSED_DIR", "data/processed")
+    processed_dir_root = Path(os.environ.get("PROCESSED_DIR", "data/processed"))
+    tenant_id = tenant or os.environ.get("TENANT_DEFAULT") or "default"
+    notebook_id = notebook or os.environ.get("NOTEBOOK_DEFAULT")
+
+    registry_targets = []
+    if notebook_id:
+        registry_targets.append(processed_dir_root / tenant_id / notebook_id)
+    else:
+        tenant_dir = processed_dir_root / tenant_id
+        if tenant_dir.exists():
+            for child in tenant_dir.iterdir():
+                if child.is_dir():
+                    registry_targets.append(child)
 
     # ファイルレジストリの削除
-    registry_path = Path(processed_dir) / "file_registry.json"
-    if registry_path.exists():
-        try:
-            registry_path.unlink()
-            logger.info(f"ファイルレジストリを削除しました: {registry_path}")
-            print(f"ファイルレジストリを削除しました: {registry_path}")
-        except Exception as e:
-            logger.error(f"ファイルレジストリの削除に失敗しました: {str(e)}")
-            print(f"ファイルレジストリの削除に失敗しました: {str(e)}")
+    for processed_dir in registry_targets:
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        registry_path = processed_dir / "file_registry.json"
+        if registry_path.exists():
+            try:
+                registry_path.unlink()
+                logger.info(f"ファイルレジストリを削除しました: {registry_path}")
+                print(f"ファイルレジストリを削除しました: {registry_path}")
+            except Exception as e:
+                logger.error(f"ファイルレジストリの削除に失敗しました: {str(e)}")
+                print(f"ファイルレジストリの削除に失敗しました: {str(e)}")
 
     # インデックスをクリア
     result = rag_service.clear_index()
@@ -73,7 +88,14 @@ def clear_index():
         sys.exit(1)
 
 
-def index_documents(directory_path, chunk_size=500, chunk_overlap=100, incremental=False):
+def index_documents(
+    directory_path,
+    chunk_size=500,
+    chunk_overlap=100,
+    incremental=False,
+    tenant: Optional[str] = None,
+    notebook: Optional[str] = None,
+):
     """
     ドキュメントをインデックス化する
 
@@ -106,8 +128,14 @@ def index_documents(directory_path, chunk_size=500, chunk_overlap=100, increment
     # RAGサービスの作成
     rag_service = create_rag_service_from_env()
 
+    tenant_id = tenant or os.environ.get("TENANT_DEFAULT") or "default"
+    notebook_id = notebook or os.environ.get("NOTEBOOK_DEFAULT") or Path(directory_path).name
+
     # 処理済みディレクトリのパス
-    processed_dir = os.environ.get("PROCESSED_DIR", "data/processed")
+    processed_root = Path(os.environ.get("PROCESSED_DIR", "data/processed"))
+    processed_dir_path = processed_root / tenant_id / notebook_id
+    processed_dir_path.mkdir(parents=True, exist_ok=True)
+    processed_dir = str(processed_dir_path)
 
     # インデックス化を実行
     if incremental:
@@ -225,10 +253,20 @@ def index_documents(directory_path, chunk_size=500, chunk_overlap=100, increment
         return results
 
     # 進捗表示付きの処理メソッドに置き換え
-    rag_service.document_processor.process_directory = process_directory_with_progress
+        rag_service.document_processor.process_directory = process_directory_with_progress
 
     # インデックス化を実行
-    result = rag_service.index_documents(directory_path, processed_dir, chunk_size, chunk_overlap, incremental)
+    result = rag_service.index_documents(
+        directory_path,
+        processed_dir,
+        chunk_size,
+        chunk_overlap,
+        incremental,
+        tenant=tenant_id,
+        notebook=notebook_id,
+        user_id=tenant_id,
+        notebook_id=notebook_id or tenant_id,
+    )
 
     # 元のメソッドに戻す
     rag_service.document_processor.process_directory = original_process_directory
@@ -254,7 +292,7 @@ def index_documents(directory_path, chunk_size=500, chunk_overlap=100, increment
         sys.exit(1)
 
 
-def get_document_count():
+def get_document_count(tenant: Optional[str] = None, notebook: Optional[str] = None):
     """
     インデックス内のドキュメント数を取得する
     """
@@ -267,11 +305,20 @@ def get_document_count():
     # RAGサービスの作成
     rag_service = create_rag_service_from_env()
 
+    tenant_id = tenant or os.environ.get("TENANT_DEFAULT") or "default"
+    notebook_id = notebook or os.environ.get("NOTEBOOK_DEFAULT")
+
     # ドキュメント数を取得
     try:
-        count = rag_service.get_document_count()
-        logger.info(f"インデックス内のドキュメント数: {count}")
-        print(f"インデックス内のドキュメント数: {count}")
+        count = rag_service.get_document_count(
+            tenant_id,
+            notebook_id,
+            user_id=tenant_id,
+            notebook_id=notebook_id or tenant_id,
+        )
+        logger.info(f"インデックス内のドキュメント数 (tenant={tenant_id}, notebook={notebook_id or '*'}) : {count}")
+        scope_label = notebook_id or "<all notebooks>"
+        print(f"インデックス内のドキュメント数 (tenant={tenant_id}, notebook={scope_label}): {count}")
     except Exception as e:
         logger.error(f"ドキュメント数の取得中にエラーが発生しました: {str(e)}")
         print(f"ドキュメント数の取得中にエラーが発生しました: {str(e)}")
@@ -291,7 +338,14 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="実行するコマンド")
 
     # clearコマンド
-    subparsers.add_parser("clear", help="インデックスをクリアする")
+    clear_parser = subparsers.add_parser("clear", help="インデックスをクリアする")
+    clear_parser.add_argument("--tenant", "-t", default=None, help="対象テナントID（省略時は環境変数TENANT_DEFAULT）")
+    clear_parser.add_argument(
+        "--notebook",
+        "-n",
+        default=None,
+        help="対象ノートブックID。省略時はすべてのノートブックのレジストリを削除します",
+    )
 
     # indexコマンド
     index_parser = subparsers.add_parser("index", help="ドキュメントをインデックス化する")
@@ -304,19 +358,40 @@ def main():
     index_parser.add_argument("--chunk-size", "-s", type=int, default=500, help="チャンクサイズ（文字数）")
     index_parser.add_argument("--chunk-overlap", "-o", type=int, default=100, help="チャンク間のオーバーラップ（文字数）")
     index_parser.add_argument("--incremental", "-i", action="store_true", help="差分のみをインデックス化する")
+    index_parser.add_argument("--tenant", "-t", default=None, help="テナントID（省略時は環境変数TENANT_DEFAULT）")
+    index_parser.add_argument(
+        "--notebook",
+        "-n",
+        default=None,
+        help="ノートブックID。省略時はディレクトリ名を使用",
+    )
 
     # countコマンド
-    subparsers.add_parser("count", help="インデックス内のドキュメント数を取得する")
+    count_parser = subparsers.add_parser("count", help="インデックス内のドキュメント数を取得する")
+    count_parser.add_argument("--tenant", "-t", default=None, help="対象テナントID（省略時は環境変数TENANT_DEFAULT）")
+    count_parser.add_argument(
+        "--notebook",
+        "-n",
+        default=None,
+        help="対象ノートブックID（省略時は全ノートブックを対象）",
+    )
 
     args = parser.parse_args()
 
     # コマンドに応じた処理を実行
     if args.command == "clear":
-        clear_index()
+        clear_index(args.tenant, args.notebook)
     elif args.command == "index":
-        index_documents(args.directory, args.chunk_size, args.chunk_overlap, args.incremental)
+        index_documents(
+            args.directory,
+            args.chunk_size,
+            args.chunk_overlap,
+            args.incremental,
+            tenant=args.tenant,
+            notebook=args.notebook,
+        )
     elif args.command == "count":
-        get_document_count()
+        get_document_count(args.tenant, args.notebook)
     else:
         parser.print_help()
         sys.exit(1)
