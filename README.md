@@ -43,9 +43,14 @@ Docker Desktopを起動した状態で、以下を1回実行すれば依存導�
 /bin/bash -c '
 set -euo pipefail
 command -v uv >/dev/null 2>&1 || brew install uv
-git clone https://github.com/your-org/mcp-rag-server.git
-cd mcp-rag-server
+git clone https://github.com/FORIFOR/map-rag-server.git
+cd map-rag-server
 cp .env.sample .env
+perl -pi -e "s/^POSTGRES_HOST=.*/POSTGRES_HOST=127.0.0.1/; \
+             s/^POSTGRES_PORT=.*/POSTGRES_PORT=5434/; \
+             s/^POSTGRES_USER=.*/POSTGRES_USER=rag/; \
+             s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ragpass/; \
+             s/^POSTGRES_DB=.*/POSTGRES_DB=ragdb/" .env
 docker run -d --name pgvector-db \
   -e POSTGRES_USER=rag \
   -e POSTGRES_PASSWORD=ragpass \
