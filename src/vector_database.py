@@ -71,6 +71,27 @@ class VectorDatabase:
             self.connection = None
             self.logger.info("データベースから切断しました")
 
+    def _ensure_connection(self) -> None:
+        """接続が閉じている場合は再接続する。"""
+        if self.connection is None:
+            self.connect()
+            return
+
+        if getattr(self.connection, "closed", 1):
+            self.logger.warning("データベース接続がクローズされていたため再接続します")
+            self.connection = None
+            self.connect()
+
+    def _safe_rollback(self) -> None:
+        """ロールバック前に接続状態を確認する。"""
+        if self.connection is None or getattr(self.connection, "closed", 1):
+            return
+
+        try:
+            self.connection.rollback()
+        except Exception as rollback_error:
+            self.logger.warning(f"ロールバックに失敗しました: {rollback_error}")
+
     def initialize_database(self) -> None:
         """
         データベースを初期化します。
@@ -82,17 +103,14 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
 
-            # pgvectorエクステンションの有効化
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-
-            # ドキュメントテーブルの作成
-            cursor.execute(f"""
+            schema_statements = [
+                "CREATE EXTENSION IF NOT EXISTS vector;",
+                f"""
                 CREATE TABLE IF NOT EXISTS documents (
                     id SERIAL PRIMARY KEY,
                     document_id TEXT UNIQUE NOT NULL,
@@ -110,43 +128,32 @@ class VectorDatabase:
                     is_global BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-
-            # 既存テーブルに不足するカラムを追加
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS notebook TEXT NOT NULL DEFAULT '';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS doc_base_id TEXT NOT NULL DEFAULT '';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS notebook_id TEXT NOT NULL DEFAULT 'default';")
-            cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_global BOOLEAN NOT NULL DEFAULT FALSE;")
-
-            # インデックスの作成
-            cursor.execute("""
+                """,
+                """
+                ALTER TABLE documents
+                    ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default',
+                    ADD COLUMN IF NOT EXISTS notebook TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS doc_base_id TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default',
+                    ADD COLUMN IF NOT EXISTS notebook_id TEXT NOT NULL DEFAULT 'default',
+                    ADD COLUMN IF NOT EXISTS is_global BOOLEAN NOT NULL DEFAULT FALSE;
+                """,
+                """
                 CREATE INDEX IF NOT EXISTS idx_documents_document_id ON documents (document_id);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_file_path ON documents (file_path);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents (tenant);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_tenant_notebook ON documents (tenant, notebook);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_tenant_doc ON documents (tenant, doc_base_id);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_scope ON documents (user_id, notebook_id);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_global ON documents (is_global);
-            """)
-            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_embedding ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-            """)
-            cursor.execute("ANALYZE documents;")
+                """,
+                "ANALYZE documents;",
+            ]
+
+            for statement in schema_statements:
+                cursor.execute(statement)
 
             # コミット
             self.connection.commit()
@@ -154,8 +161,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"データベースの初期化に失敗しました: {str(e)}")
             raise
 
@@ -197,8 +203,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -250,8 +255,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ドキュメントの挿入に失敗しました: {str(e)}")
             raise
 
@@ -283,8 +287,7 @@ class VectorDatabase:
 
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -340,8 +343,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ドキュメントのバッチ挿入に失敗しました: {str(e)}")
             raise
 
@@ -376,8 +378,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -449,55 +450,8 @@ class VectorDatabase:
             params.append(limit)
             cursor.execute(query, params)
 
-            # 結果の取得
-            results = []
-            for row in cursor.fetchall():
-                (
-                    document_id,
-                    row_tenant,
-                    row_notebook,
-                    doc_base_id,
-                    title,
-                    content,
-                    file_path,
-                    chunk_index,
-                    metadata_json,
-                    row_user_id,
-                    row_notebook_id,
-                    row_is_global,
-                    similarity,
-                ) = row
-
-                # メタデータをJSONからデコード
-                if metadata_json:
-                    if isinstance(metadata_json, str):
-                        try:
-                            metadata = json.loads(metadata_json)
-                        except json.JSONDecodeError:
-                            metadata = {}
-                    else:
-                        # 既に辞書型の場合はそのまま使用
-                        metadata = metadata_json
-                else:
-                    metadata = {}
-
-                results.append(
-                    {
-                        "document_id": document_id,
-                        "tenant": row_tenant,
-                        "notebook": row_notebook,
-                        "doc_base_id": doc_base_id,
-                        "title": title,
-                        "content": content,
-                        "file_path": file_path,
-                        "chunk_index": chunk_index,
-                        "metadata": metadata,
-                        "user_id": row_user_id,
-                        "notebook_id": row_notebook_id,
-                        "is_global": bool(row_is_global),
-                        "similarity": similarity,
-                    }
-                )
+            rows = cursor.fetchall()
+            results = [self._map_row_to_document(row) for row in rows]
 
             self.logger.info(f"クエリに対して {len(results)} 件の結果が見つかりました")
             return results
@@ -510,6 +464,149 @@ class VectorDatabase:
             # カーソルを閉じる
             if "cursor" in locals() and cursor:
                 cursor.close()
+
+    def search_by_keywords(
+        self,
+        keywords: Sequence[str],
+        limit: int = 5,
+        *,
+        tenant: Optional[str] = None,
+        notebook: Optional[str] = None,
+        user_id: Optional[str] = None,
+        notebook_id: Optional[str] = None,
+        include_global: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """キーワード（部分一致）でチャンクを検索します。"""
+
+        normalized = [kw.strip() for kw in keywords if isinstance(kw, str) and kw.strip()]
+        if not normalized:
+            return []
+
+        try:
+            self._ensure_connection()
+
+            cursor = self.connection.cursor()
+
+            where_clauses = ["content IS NOT NULL"]
+            params: List[Any] = []
+            scope_user = (user_id or "").strip()
+            scope_notebook = (notebook_id or "").strip()
+            if not scope_user or not scope_notebook:
+                raise ValueError("user_id と notebook_id は必須です")
+            if tenant:
+                where_clauses.append("tenant = %s")
+                params.append(tenant)
+            if notebook:
+                where_clauses.append("notebook = %s")
+                params.append(notebook)
+            scope_clause = "(user_id = %s AND notebook_id = %s)"
+            if include_global:
+                scope_clause = f"({scope_clause} OR is_global = TRUE)"
+            where_clauses.append(scope_clause)
+            params.extend([scope_user, scope_notebook])
+
+            keyword_clauses = []
+            keyword_score_parts = []
+            for kw in normalized:
+                pattern = f"%{kw}%"
+                keyword_clauses.append("(content ILIKE %s OR title ILIKE %s)")
+                params.extend([pattern, pattern])
+                keyword_score_parts.append("(CASE WHEN content ILIKE %s THEN 1 ELSE 0 END)")
+                keyword_score_parts.append("(CASE WHEN title ILIKE %s THEN 0.5 ELSE 0 END)")
+                params.extend([pattern, pattern])
+
+            where_clauses.append(f"({' OR '.join(keyword_clauses)})")
+            keyword_score_sql = " + ".join(keyword_score_parts) or "0"
+
+            where_sql = " AND ".join(where_clauses)
+            query = f"""
+                SELECT
+                    document_id,
+                    tenant,
+                    notebook,
+                    doc_base_id,
+                    title,
+                    content,
+                    file_path,
+                    chunk_index,
+                    metadata,
+                    user_id,
+                    notebook_id,
+                    is_global,
+                    NULL::float8 AS similarity,
+                    {keyword_score_sql} AS keyword_hits
+                FROM
+                    documents
+                WHERE
+                    {where_sql}
+                ORDER BY
+                    keyword_hits DESC,
+                    created_at DESC
+                LIMIT %s;
+            """
+            params.append(limit)
+            cursor.execute(query, params)
+
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                mapped = self._map_row_to_document(row[:13])
+                mapped["similarity"] = mapped.get("similarity") or 0.0
+                meta = dict(mapped.get("metadata") or {})
+                meta["keyword_hits"] = row[13]
+                mapped["metadata"] = meta
+                results.append(mapped)
+            return results
+        except Exception as e:
+            self.logger.error(f"キーワード検索中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            if "cursor" in locals() and cursor:
+                cursor.close()
+
+    def _map_row_to_document(self, row: Sequence[Any]) -> Dict[str, Any]:
+        (
+            document_id,
+            row_tenant,
+            row_notebook,
+            doc_base_id,
+            title,
+            content,
+            file_path,
+            chunk_index,
+            metadata_json,
+            row_user_id,
+            row_notebook_id,
+            row_is_global,
+            similarity,
+        ) = row
+
+        if metadata_json:
+            if isinstance(metadata_json, str):
+                try:
+                    metadata = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    metadata = {}
+            else:
+                metadata = metadata_json
+        else:
+            metadata = {}
+
+        return {
+            "document_id": document_id,
+            "tenant": row_tenant,
+            "notebook": row_notebook,
+            "doc_base_id": doc_base_id,
+            "title": title,
+            "content": content,
+            "file_path": file_path,
+            "chunk_index": chunk_index,
+            "metadata": metadata,
+            "user_id": row_user_id,
+            "notebook_id": row_notebook_id,
+            "is_global": bool(row_is_global),
+            "similarity": similarity,
+        }
 
     def delete_document(self, document_id: str) -> bool:
         """
@@ -526,8 +623,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -550,8 +646,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ドキュメントの削除中にエラーが発生しました: {str(e)}")
             raise
 
@@ -575,8 +670,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -595,8 +689,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ドキュメントの削除中にエラーが発生しました: {str(e)}")
             raise
 
@@ -617,8 +710,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # 削除前のドキュメント数を取得
             count_before_delete = self.get_document_count()
@@ -642,8 +734,7 @@ class VectorDatabase:
 
         except Exception as e:
             # ロールバック
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"データベースのクリア中にエラーが発生しました: {str(e)}")
             raise
 
@@ -672,8 +763,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -706,7 +796,7 @@ class VectorDatabase:
 
         except psycopg2.errors.UndefinedTable:
             # テーブルが存在しない場合は0を返す
-            self.connection.rollback()  # エラー状態をリセット
+            self._safe_rollback()  # エラー状態をリセット
             self.logger.info("documentsテーブルが存在しないため、ドキュメント数は0です")
             return 0
         except Exception as e:
@@ -726,8 +816,7 @@ class VectorDatabase:
         ドキュメント一覧を返します（ファイル単位で集約）。
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             cursor = self.connection.cursor()
             params: List[Any] = []
@@ -813,8 +902,7 @@ class VectorDatabase:
             include_global: グローバル資料を含めるかどうか
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             scope_user = (user_id or "").strip()
             if not scope_user:
@@ -876,8 +964,7 @@ class VectorDatabase:
         テナント＋doc_base_id でドキュメントを削除します。
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             cursor = self.connection.cursor()
             cursor.execute(
@@ -889,8 +976,7 @@ class VectorDatabase:
             self.logger.info(f"tenant={tenant} notebook={notebook} doc={doc_base_id} を削除しました（{deleted_rows}件）")
             return deleted_rows
         except Exception as e:
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ドキュメント削除中にエラーが発生しました: {str(e)}")
             raise
         finally:
@@ -902,8 +988,7 @@ class VectorDatabase:
         指定テナントのドキュメントを全削除します。
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             cursor = self.connection.cursor()
             if notebook:
@@ -918,8 +1003,7 @@ class VectorDatabase:
                 self.logger.info(f"tenant={tenant} のドキュメントを削除しました（{deleted_rows}件）")
             return deleted_rows
         except Exception as e:
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"テナント削除中にエラーが発生しました: {str(e)}")
             raise
         finally:
@@ -938,8 +1022,7 @@ class VectorDatabase:
         指定ユーザーのノートブックに紐づくドキュメントを削除します。
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             scope_user = (user_id or "").strip()
             scope_notebook_id = (notebook_id or "").strip()
@@ -970,8 +1053,7 @@ class VectorDatabase:
             )
             return deleted_rows
         except Exception as e:
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"ノートブック削除中にエラーが発生しました: {str(e)}")
             raise
         finally:
@@ -985,8 +1067,7 @@ class VectorDatabase:
             移動した行数
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             cursor = self.connection.cursor()
             cursor.execute(
@@ -1003,11 +1084,10 @@ class VectorDatabase:
                 self.connection.commit()
                 self.logger.info(f"defaultスコープからlibraryへ {moved} 件のドキュメントを移動しました")
             else:
-                self.connection.rollback()
+                self._safe_rollback()
             return moved
         except Exception as e:
-            if self.connection:
-                self.connection.rollback()
+            self._safe_rollback()
             self.logger.error(f"defaultスコープからの移行に失敗しました: {str(e)}")
             raise
         finally:
@@ -1027,8 +1107,7 @@ class VectorDatabase:
         ドキュメントの代表的なメタデータを1件返します。
         """
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             cursor = self.connection.cursor()
             scope_user = (user_id or "").strip()
@@ -1109,8 +1188,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -1200,8 +1278,7 @@ class VectorDatabase:
         """
         try:
             # 接続がない場合は接続
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             # カーソルの作成
             cursor = self.connection.cursor()
@@ -1286,8 +1363,7 @@ class VectorDatabase:
         if not doc_list:
             return []
         try:
-            if not self.connection:
-                self.connect()
+            self._ensure_connection()
 
             scope_user = (user_id or "").strip()
             scope_notebook_id = (notebook_id or "").strip()

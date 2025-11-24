@@ -36,6 +36,29 @@ MCP RAG Serverは、Model Context Protocol (MCP)に準拠したRAG（Retrieval-A
 
 ## インストール
 
+### Macで“ワンライナー”最短セットアップ
+Docker Desktopを起動した状態で、以下を1回実行すれば依存導入〜DB起動〜サーバー起動まで完了します。
+
+```bash
+/bin/bash -c '
+set -euo pipefail
+command -v uv >/dev/null 2>&1 || brew install uv
+git clone https://github.com/your-org/mcp-rag-server.git
+cd mcp-rag-server
+cp .env.sample .env
+docker run -d --name pgvector-db \
+  -e POSTGRES_USER=rag \
+  -e POSTGRES_PASSWORD=ragpass \
+  -e POSTGRES_DB=ragdb \
+  -p 5434:5432 \
+  pgvector/pgvector:pg16
+uv sync
+uv run python -m src.http_server
+'
+```
+
+> 既にリポジトリを持っている場合は `git clone` 部分を削って使用してください。
+
 ### 依存関係のインストール
 
 ```bash

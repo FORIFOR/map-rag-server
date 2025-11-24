@@ -12,11 +12,13 @@ import re
 import shutil
 import time
 import unicodedata
+from urllib.parse import quote
 import uuid
 from collections import Counter
 import statistics
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from itertools import chain
 
 import regex as regex
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -43,6 +45,9 @@ from starlette.concurrency import run_in_threadpool
 
 from .rag_tools import create_rag_service_from_env
 from .llm_router import LLMRouter
+from .nextcloud_client import NextcloudRequestError, get_nextcloud_client, normalize_nextcloud_path
+from . import file_storage
+from pydantic import BaseModel
 
 
 app = FastAPI(title="MCP RAG HTTP API", version="0.1.0")
@@ -63,17 +68,45 @@ RAG_TENANT_DEFAULT = os.environ.get("RAG_DEFAULT_TENANT", "default")
 SOURCE_BASE = Path(os.environ.get("SOURCE_DIR", "data/source"))
 PROCESSED_BASE = Path(os.environ.get("PROCESSED_DIR", "data/processed"))
 CONVERSATION_BASE = Path(os.environ.get("CONVERSATION_DIR", "data/conversations"))
+FILE_STORAGE_ROOT = Path(os.environ.get("FILE_STORAGE_ROOT", "data/files")).resolve()
+FILE_REGISTRY_PATH = Path(os.environ.get("FILE_REGISTRY_PATH", FILE_STORAGE_ROOT / "registry.json")).resolve()
 
 FINAL_CONTEXT_MAX_CHUNKS = int(os.getenv("FINAL_CONTEXT_MAX_CHUNKS", "4"))
 FINAL_CONTEXT_TRIM_CHARS = int(os.getenv("FINAL_CONTEXT_TRIM_CHARS", "1600"))
 SUMMARY_WINDOW_MAX_CHARS = int(os.getenv("SUMMARY_WINDOW_MAX_CHARS", "2800"))
 SUMMARY_MAX_WINDOWS = int(os.getenv("SUMMARY_MAX_WINDOWS", "6"))
 SUMMARY_MAP_CONCURRENCY = max(1, int(os.getenv("SUMMARY_MAP_CONCURRENCY", "3")))
-SUMMARY_LLM_TIMEOUT_SEC = int(os.getenv("SUMMARY_LLM_TIMEOUT_SEC", "60"))
-SUMMARY_MAX_CHUNK_LIMIT = int(os.getenv("SUMMARY_MAX_CHUNK_LIMIT", "0"))
-SUMMARY_GENERATE_TIMEOUT_SEC = int(os.getenv("SUMMARY_GENERATE_TIMEOUT_S", str(SUMMARY_LLM_TIMEOUT_SEC)))
-SUMMARY_MAP_TIMEOUT_SEC = int(os.getenv("SUMMARY_MAP_TIMEOUT_S", str(SUMMARY_LLM_TIMEOUT_SEC)))
-SUMMARY_REDUCE_TIMEOUT_SEC = int(os.getenv("SUMMARY_REDUCE_TIMEOUT_S", str(SUMMARY_GENERATE_TIMEOUT_SEC)))
+
+
+def _env_int(keys: Iterable[str], default: int) -> int:
+    """
+    環境変数を優先順に評価して整数値を取得する。
+    不正な値はスキップし、最終的にデフォルトを返す。
+    """
+    if isinstance(keys, str):
+        keys = (keys,)
+    for key in keys:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            logging.getLogger("mcp.http").warning("環境変数 %s の値 '%s' を整数に変換できませんでした", key, raw)
+    return default
+
+
+SUMMARY_LLM_TIMEOUT_SEC = _env_int(("SUMMARY_LLM_TIMEOUT_SEC",), 0)
+SUMMARY_MAX_CHUNK_LIMIT = _env_int(("SUMMARY_MAX_CHUNK_LIMIT",), 0)
+SUMMARY_GENERATE_TIMEOUT_SEC = _env_int(("SUMMARY_GENERATE_TIMEOUT_SEC", "SUMMARY_GENERATE_TIMEOUT_S"), SUMMARY_LLM_TIMEOUT_SEC)
+SUMMARY_MAP_TIMEOUT_SEC = _env_int(("SUMMARY_MAP_TIMEOUT_SEC", "SUMMARY_MAP_TIMEOUT_S"), SUMMARY_LLM_TIMEOUT_SEC)
+SUMMARY_REDUCE_TIMEOUT_SEC = _env_int(
+    ("SUMMARY_REDUCE_TIMEOUT_SEC", "SUMMARY_REDUCE_TIMEOUT_S"),
+    SUMMARY_GENERATE_TIMEOUT_SEC,
+)
 SUMMARY_MAP_MAX_TOKENS = int(os.getenv("SUMMARY_MAP_MAX_TOKENS", "200"))
 SUMMARY_REDUCE_MAX_TOKENS = int(os.getenv("SUMMARY_REDUCE_MAX_TOKENS", "320"))
 SUMMARY_MAP_MODEL = os.getenv("SUMMARY_MAP_MODEL")
@@ -119,6 +152,60 @@ PROMPT_INLINE_KEYWORDS = tuple(
 SOURCE_BASE.mkdir(parents=True, exist_ok=True)
 PROCESSED_BASE.mkdir(parents=True, exist_ok=True)
 CONVERSATION_BASE.mkdir(parents=True, exist_ok=True)
+FILE_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+FILE_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_storage_scope(value: str) -> str:
+    normalized = (value or "personal").strip().lower()
+    if normalized not in {"personal", "org"}:
+        raise HTTPException(status_code=400, detail="scope must be 'personal' or 'org'")
+    return normalized
+
+
+def _normalize_folder_path(value: str) -> str:
+    cleaned = (value or "/").strip()
+    if not cleaned.startswith("/"):
+        cleaned = f"/{cleaned}"
+    cleaned = cleaned.replace("//", "/")
+    return cleaned or "/"
+
+
+def _resolve_source_path(meta: Dict[str, Any]) -> Optional[Path]:
+    """
+    メタ情報からPDFの実体パスを解決する。
+    既存パスが欠損した場合はファイル名を頼りにSOURCE_BASE配下を再探索する。
+    """
+    path_candidates: List[Path] = []
+    for key in ("source_file_path", "source_uri"):
+        raw = meta.get(key)
+        if raw:
+            path_candidates.append(Path(str(raw)))
+
+    for candidate in path_candidates:
+        if candidate.exists():
+            return candidate
+
+    names: List[str] = []
+    for val in (
+        meta.get("source_file_path"),
+        meta.get("source_uri"),
+        meta.get("title"),
+        (meta.get("doc_id") or "").split(":")[-1],
+    ):
+        if not val:
+            continue
+        names.append(Path(str(val)).name)
+
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        for found in SOURCE_BASE.rglob(name):
+            return found
+
+    return None
 
 _ZERO_WIDTH_PATTERN = re.compile(r"[\u00AD\u200B\u200C\u200D]")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -190,6 +277,86 @@ def _extract_text_context(text: Optional[str], needle: Optional[str], radius: in
     if end < len(text):
         snippet += "…"
     return snippet
+
+
+ANSWER_NEGATION_PATTERNS = tuple(
+    phrase.lower()
+    for phrase in (
+        "含まれていません",
+        "含まれておりません",
+        "見つかりません",
+        "存在しません",
+        "記載されていません",
+        "見当たりません",
+    )
+)
+
+
+def _keywords_from_query(query: str) -> List[str]:
+    lowered = (query or "").lower()
+    priority_terms = getattr(rag_service, "PRIORITY_KEYWORD_TERMS", ())
+    hits: List[str] = []
+    for term in priority_terms:
+        if term.lower() in lowered:
+            hits.append(term)
+    return hits
+
+
+def _context_contains_keywords(contexts: Sequence[Dict[str, Any]], keywords: Sequence[str]) -> List[str]:
+    if not keywords:
+        return []
+    joined = "\n".join((ctx.get("content") or "") for ctx in contexts).lower()
+    return [kw for kw in keywords if kw.lower() in joined]
+
+
+def _find_keyword_snippet(contexts: Sequence[Dict[str, Any]], keyword: str) -> Tuple[Optional[str], Optional[str]]:
+    for ctx in contexts:
+        text = ctx.get("content") or ""
+        idx = text.lower().find(keyword.lower())
+        if idx == -1:
+            continue
+        start = max(0, idx - 80)
+        end = min(len(text), idx + len(keyword) + 160)
+        snippet = text[start:end].strip()
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(text):
+            snippet = snippet + "…"
+        title = ctx.get("title") or ctx.get("metadata", {}).get("file_name")
+        return snippet, title
+    return None, None
+
+
+def _apply_keyword_guard(query: str, contexts: Sequence[Dict[str, Any]], answer_text: str) -> str:
+    if not answer_text:
+        return answer_text
+    keywords = _keywords_from_query(query)
+    if not keywords:
+        return answer_text
+    present = _context_contains_keywords(contexts, keywords)
+    if not present:
+        return answer_text
+    lowered = answer_text.lower()
+    if not any(pattern in lowered for pattern in ANSWER_NEGATION_PATTERNS):
+        return answer_text
+    keyword = present[0]
+    snippet, title = _find_keyword_snippet(contexts, keyword)
+    logger.warning(
+        "Answer guard triggered for keyword '%s' (query=%s)",
+        keyword,
+        query,
+    )
+    if snippet:
+        header = f"このノートブックのコンテキストには「{keyword}」に関する記述があります。"
+        if title:
+            header += f"（{title}より）"
+        safe = f"{header}\n\n抜粋:\n{snippet}\n\nこの情報を参照して内容を判断してください。"
+    else:
+        safe = (
+            f"このノートブックのコンテキストには「{keyword}」という語が登場しているため、"
+            "完全に情報が欠落しているとは言えません。引用箇所を参照してください。"
+        )
+    return safe
 
 
 def _log_rect_debug(
@@ -1808,6 +1975,20 @@ class SummarizeRequest(ScopedPayload):
         return cleaned
 
 
+class NextcloudIngestRequest(ScopedPayload):
+    path: str
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _normalize_path(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("path is required")
+        normalized = normalize_nextcloud_path(value)
+        if normalized == "/":
+            raise ValueError("path must not be root")
+        return normalized
+
+
 class NotebookSummary(BaseModel):
     notebook_id: str
     title: Optional[str] = None
@@ -1818,6 +1999,22 @@ class NotebookSummary(BaseModel):
 def _tenant_dir(base: Path, tenant: str) -> Path:
     safe_tenant = tenant.strip() or RAG_TENANT_DEFAULT
     return base / safe_tenant
+
+
+def _sanitize_path_segment(segment: str) -> str:
+    cleaned = (segment or "").strip()
+    cleaned = cleaned.replace("\\", "_").replace("..", "_")
+    cleaned = re.sub(r'[:*?"<>|]', "_", cleaned)
+    cleaned = cleaned.strip().strip(".")
+    return cleaned or "segment"
+
+
+def _local_relpath_from_nextcloud(path: str) -> Path:
+    segments = [seg for seg in path.strip("/").split("/") if seg]
+    if not segments:
+        return Path(f"nextcloud_{int(time.time())}")
+    safe_segments = [_sanitize_path_segment(seg) for seg in segments]
+    return Path(*safe_segments)
 
 
 def _scope_from_query(request: Request) -> ScopedPayload:
@@ -2046,8 +2243,11 @@ async def _llm_complete_text(
         return {"text": "".join(tokens).strip(), "llm": llm_info}
 
     if timeout and timeout > 0:
-        return await asyncio.wait_for(_collect(), timeout=timeout)
-    return await _collect()
+        result = await asyncio.wait_for(_collect(), timeout=timeout)
+    else:
+        result = await _collect()
+    result["text"] = _apply_keyword_guard(query, contexts, result.get("text", ""))
+    return result
 
 
 async def _execute_summary(
@@ -2267,10 +2467,11 @@ def _prepare_context_chunks(results: List[Dict[str, Any]]) -> List[Dict[str, Any
     limited = results[: max(1, FINAL_CONTEXT_MAX_CHUNKS)]
     prepared: List[Dict[str, Any]] = []
     for item in limited:
-        trimmed = _trim_context_text(item.get("content", ""))
+        raw_text = item.get("content") or ""
+        trimmed = _trim_context_text(raw_text)
         if not trimmed:
             continue
-        prepared.append({**item, "content": trimmed})
+        prepared.append({**item, "content": trimmed, "_raw_content": raw_text})
     return prepared
 
 
@@ -2538,10 +2739,9 @@ async def get_document_pdf(
     except ValueError:
         raise HTTPException(status_code=404, detail={"error": "document_not_found", "rid": rid})
 
-    source_path = doc.get("source_file_path") or doc.get("source_uri")
-    if not source_path:
+    path = _resolve_source_path(doc)
+    if not path:
         raise HTTPException(status_code=404, detail={"error": "source_unavailable", "rid": rid})
-    path = Path(str(source_path))
     if not path.exists():
         raise HTTPException(status_code=404, detail={"error": "source_not_found", "rid": rid})
 
@@ -2561,9 +2761,11 @@ async def get_document_pdf(
                 remaining -= len(data)
                 yield data
 
+    ascii_name = path.name.encode("ascii", "ignore").decode("ascii") or path.stem
+    disposition = f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(path.name)}"
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{path.name}"',
+        "Content-Disposition": disposition,
         "x-request-id": rid,
     }
 
@@ -2637,10 +2839,9 @@ async def get_document_rects(
     except ValueError:
         raise HTTPException(status_code=404, detail={"error": "document_not_found", "rid": rid})
 
-    source_path = doc.get("source_file_path") or doc.get("source_uri")
-    if not source_path:
+    path = _resolve_source_path(doc)
+    if not path:
         raise HTTPException(status_code=404, detail={"error": "source_unavailable", "rid": rid})
-    path = Path(str(source_path))
     if not path.exists():
         raise HTTPException(status_code=404, detail={"error": "source_not_found", "rid": rid})
 
@@ -3000,6 +3201,112 @@ async def ingest_documents(
     return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
 
 
+@app.post("/api/ingest/from-nextcloud")
+@app.post("/ingest/from-nextcloud")
+async def ingest_from_nextcloud_endpoint(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    rid = _ensure_request_id(request)
+    try:
+        payload_json = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail={"error": "invalid_payload", "rid": rid})
+    try:
+        payload = NextcloudIngestRequest(**payload_json)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_scope", "detail": exc.errors(), "rid": rid},
+        )
+
+    client = get_nextcloud_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "nextcloud_not_configured", "rid": rid},
+        )
+
+    try:
+        file_bytes = await client.download_file(payload.path)
+    except NextcloudRequestError as exc:
+        status = exc.status_code if exc.status_code is not None else 502
+        status_code = status if status in (401, 403, 404) else 502
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": "nextcloud_fetch_failed",
+                "detail": str(exc),
+                "status": exc.status_code,
+                "rid": rid,
+            },
+        )
+
+    scope_payload = payload
+    source_dir = _tenant_dir(SOURCE_BASE, scope_payload.tenant) / scope_payload.notebook
+    processed_dir = _tenant_dir(PROCESSED_BASE, scope_payload.tenant) / scope_payload.notebook
+    source_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    local_rel = _local_relpath_from_nextcloud(scope_payload.path)
+    dest_path = source_dir / local_rel
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with dest_path.open("wb") as fp:
+            fp.write(file_bytes)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "write_failed", "detail": str(exc), "rid": rid},
+        )
+
+    try:
+        result = rag_service.index_documents(
+            str(source_dir),
+            processed_dir=str(processed_dir),
+            incremental=True,
+            tenant=scope_payload.tenant,
+            notebook=scope_payload.notebook,
+            user_id=scope_payload.user_id,
+            notebook_id=scope_payload.notebook_id,
+            include_global=scope_payload.include_global,
+        )
+    except Exception as exc:
+        _remove_file_if_exists(str(dest_path))
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "ingest_failed", "detail": str(exc), "rid": rid},
+        )
+
+    documents = rag_service.list_documents(
+        scope_payload.tenant,
+        scope_payload.notebook,
+        user_id=scope_payload.user_id,
+        notebook_id=scope_payload.notebook_id,
+        include_global=scope_payload.include_global,
+    )
+    if result.get("success"):
+        background_tasks.add_task(
+            rag_service.warm_up,
+            scope_payload.tenant,
+            scope_payload.notebook,
+            user_id=scope_payload.user_id,
+            notebook_id=scope_payload.notebook_id,
+        )
+
+    payload = {
+        "ok": result.get("success", False),
+        "doc_ids": result.get("doc_ids", []),
+        "nextcloud_path": scope_payload.path,
+        "saved_path": str(dest_path),
+        "documents": documents,
+        "rid": rid,
+    }
+    response = JSONResponse(_json_safe(payload))
+    response.headers["x-request-id"] = rid
+    return response
+
+
 @app.get("/api/ingest/status")
 @app.get("/ingest/status")
 async def ingest_status(request: Request):
@@ -3169,10 +3476,25 @@ def _build_citations(results: List[dict]) -> List[dict]:
     citations = []
     for idx, res in enumerate(results, start=1):
         meta = res.get("metadata") or {}
-        snippet = (res.get("content") or meta.get("snippet") or "").strip()
+        raw_anchor = res.get("_raw_content") or res.get("content") or meta.get("snippet") or ""
+        anchor_phrase = raw_anchor.strip()
+        if anchor_phrase and len(anchor_phrase) > 1600:
+            anchor_phrase = anchor_phrase[:1600].rstrip()
+        snippet_source = res.get("content") or meta.get("snippet") or anchor_phrase
+        snippet = (snippet_source or "").strip()
         snippet = re.sub(r"\s+", " ", snippet) if snippet else ""
         if snippet and len(snippet) > 240:
             snippet = snippet[:240].rstrip() + "…"
+        offsets = meta.get("offsets")
+        anchor_start: Optional[int] = None
+        anchor_end: Optional[int] = None
+        if isinstance(offsets, (list, tuple)) and len(offsets) >= 2:
+            try:
+                anchor_start = int(offsets[0]) if offsets[0] is not None else None
+                anchor_end = int(offsets[1]) if offsets[1] is not None else None
+            except (TypeError, ValueError):
+                anchor_start = None
+                anchor_end = None
         citations.append(
             {
                 "id": idx,
@@ -3181,6 +3503,9 @@ def _build_citations(results: List[dict]) -> List[dict]:
                 "uri": meta.get("source_file_path", ""),
                 "page": meta.get("page"),
                 "snippet": snippet,
+                "anchor_phrase": anchor_phrase or None,
+                "anchor_char_start": anchor_start,
+                "anchor_char_end": anchor_end,
             }
         )
     return citations
@@ -3504,6 +3829,140 @@ async def get_file_metadata(request: Request, doc_id: str):
     return response
 
 
+class FileLinkPayload(BaseModel):
+    tenant: str
+    user_id: str
+    notebook_id: str
+    item_ids: List[str] = Field(default_factory=list)
+    include_global: bool = False
+
+
+class FileDeletePayload(BaseModel):
+    tenant: str
+    user_id: str
+    item_ids: List[str] = Field(default_factory=list)
+
+
+@app.post("/library/files")
+async def upload_library_file(
+    file: UploadFile = File(...),
+    tenant: str = Form(...),
+    user_id: str = Form(...),
+    scope: str = Form("personal"),
+    folder_path: str = Form("/"),
+    notebook_id: Optional[str] = Form(default=None),
+):
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    storage_path = file_storage.store_bytes(payload, suffix=Path(file.filename or "").suffix)
+    metadata = file_storage.create_metadata(
+        tenant=tenant.strip() or RAG_TENANT_DEFAULT,
+        user_id=user_id.strip() or "local",
+        scope=_normalize_storage_scope(scope),
+        folder_path=_normalize_folder_path(folder_path),
+        notebook_id=notebook_id.strip() if notebook_id else None,
+        original_name=file.filename or "uploaded-file",
+        mime_type=file.content_type or "application/octet-stream",
+        size_bytes=len(payload),
+        storage_path=storage_path,
+    )
+    stored = file_storage.register_file(metadata)
+    return stored
+
+
+@app.get("/library/files")
+async def list_library_files(
+    tenant: Optional[str] = Query(default=None),
+    user_id: Optional[str] = Query(default=None),
+    folder_path: Optional[str] = Query(default=None),
+):
+    records = file_storage.list_files(tenant=tenant, user_id=user_id, folder_path=folder_path)
+    return {"items": records, "count": len(records)}
+
+
+@app.get("/library/files/folders")
+async def list_library_folders(
+    tenant: Optional[str] = Query(default=None),
+    user_id: Optional[str] = Query(default=None),
+):
+    folders = file_storage.list_folders(tenant=tenant, user_id=user_id)
+    return {"folders": folders}
+
+
+@app.get("/library/files/{file_id}")
+async def get_library_file(file_id: str):
+    record = file_storage.get_file(file_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="File not found")
+    return record
+
+
+@app.get("/library/files/{file_id}/download")
+async def download_library_file(file_id: str):
+    record = file_storage.get_file(file_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="File not found")
+    storage_path = Path(record.get("storage_path", ""))
+    if not storage_path.exists():
+        raise HTTPException(status_code=404, detail="Stored file missing")
+    return FileResponse(
+        storage_path,
+        media_type=record.get("mime_type") or "application/octet-stream",
+        filename=record.get("original_name") or "download",
+    )
+
+
+@app.post("/library/files/link")
+async def link_library_files(payload: FileLinkPayload):
+    if not payload.item_ids:
+        raise HTTPException(status_code=422, detail="item_ids must not be empty")
+
+    successes: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for file_id in payload.item_ids:
+        record = file_storage.get_file(file_id)
+        if not record:
+            errors.append({"id": file_id, "error": "not_found"})
+            continue
+        storage_path = Path(record.get("storage_path", ""))
+        if not storage_path.exists():
+            errors.append({"id": file_id, "error": "missing_file"})
+            continue
+        try:
+            result = await _ingest_stored_file(
+                storage_path,
+                original_name=record.get("original_name") or file_id,
+                tenant=payload.tenant.strip() or RAG_TENANT_DEFAULT,
+                user_id=payload.user_id.strip() or "local",
+                notebook_id=payload.notebook_id.strip(),
+                include_global=payload.include_global,
+            )
+            file_storage.update_file(file_id, notebook_id=payload.notebook_id.strip())
+            successes.append({"id": file_id, "ingest": result})
+        except Exception as exc:
+            errors.append({"id": file_id, "error": str(exc)})
+
+    if not successes and errors:
+        raise HTTPException(status_code=502, detail={"error": "link_failed", "detail": errors})
+    return {"linked": successes, "errors": errors}
+
+
+@app.post("/library/files/delete")
+async def delete_library_files(payload: FileDeletePayload):
+    if not payload.item_ids:
+        raise HTTPException(status_code=422, detail="item_ids must not be empty")
+    deleted: List[str] = []
+    errors: List[Dict[str, Any]] = []
+    for file_id in payload.item_ids:
+        success = file_storage.delete_file(file_id)
+        if success:
+            deleted.append(file_id)
+        else:
+            errors.append({"id": file_id, "error": "not_found"})
+    return {"deleted": deleted, "errors": errors}
+
+
 def main():
     import uvicorn
 
@@ -3522,3 +3981,35 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+async def _ingest_stored_file(
+    storage_path: Path,
+    *,
+    original_name: str,
+    tenant: str,
+    user_id: str,
+    notebook_id: str,
+    include_global: bool,
+) -> Dict[str, Any]:
+    tmp_dir = SOURCE_BASE / "__library_tmp__" / uuid.uuid4().hex
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    target_path = tmp_dir / original_name
+    try:
+        shutil.copy2(storage_path, target_path)
+        result = await run_in_threadpool(
+            rag_service.index_documents,
+            str(tmp_dir),
+            str(PROCESSED_BASE),
+            500,
+            100,
+            False,
+            tenant=tenant,
+            notebook=notebook_id,
+            user_id=user_id,
+            notebook_id=notebook_id,
+            include_global=include_global,
+        )
+        return result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

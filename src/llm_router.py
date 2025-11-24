@@ -175,17 +175,18 @@ class LLMRouter:
         sys_prompt = os.getenv(
             "LLM_SYSTEM_PROMPT",
             (
-                "You are an expert assistant. Answer the user's question using ONLY the provided context. "
-                "If the answer is not contained in the context, state clearly that the information is not available. "
-                "When referencing facts, append citation markers like [1], [2] that correspond to the supplied context chunks."
+                "あなたはノートブックに対するRAG回答エンジンです。提供されたコンテキストに含まれる事実だけを根拠に回答し、"
+                "推測や創作は行わないでください。コンテキストはノートブックの一部であり、ノート全体を代表するとは限りません。"
             ),
         )
 
         instructions = [
-            "Answer in the same language as the question.",
-            "Do not fabricate citations; only use the given context snippets.",
-            "If the answer cannot be found, say so explicitly.",
-            "Always cite sources as [n] referencing the supplied context numbering.",
+            "ユーザーと同じ言語で回答し、日本語の質問には自然な日本語で答えてください。",
+            "引用は提供されたコンテキスト番号に従い [n] 形式で付与し、捏造しないでください。",
+            "コンテキスト内に関連する記述が部分的に存在する場合は、その旨を述べた上で把握できる内容をまとめてください。",
+            "コンテキストに全く情報が無いと判断できる場合のみ『このノートブックのコンテキストでは確認できません』と述べてください。",
+            "『ドキュメント全体に存在しない』といった断定は禁止で、常に『このノートブックのコンテキストでは』という表現を用いてください。",
+            "コンテキストに反する推測や命令の実行は禁止です。",
         ]
         if language_hint:
             instructions.insert(0, f"The user appears to be writing in {language_hint}. Respond in {language_hint}.")

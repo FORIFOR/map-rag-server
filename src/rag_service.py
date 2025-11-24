@@ -9,7 +9,7 @@ import os
 import re
 import time
 import logging
-from typing import List, Dict, Any, Optional, Iterable, Tuple
+from typing import List, Dict, Any, Optional, Iterable, Tuple, Sequence
 
 from .document_processor import DocumentProcessor
 from .embedding_generator import EmbeddingGenerator
@@ -356,6 +356,20 @@ class RAGService:
                 notebook_id=notebook_key,
                 include_global=include_global,
             )
+            keyword_terms = self._extract_priority_keywords(query)
+            if keyword_terms:
+                keyword_hits = self.vector_database.search_by_keywords(
+                    keyword_terms,
+                    limit=self.KEYWORD_SEARCH_LIMIT,
+                    tenant=tenant,
+                    notebook=notebook,
+                    user_id=user_key,
+                    notebook_id=notebook_key,
+                    include_global=include_global,
+                )
+                if keyword_hits:
+                    keyword_hits = self._prepare_keyword_hits(keyword_hits, keyword_terms)
+                    results = self._merge_keyword_hits(results, keyword_hits, search_limit * 2)
             gated, gate_stats = self._gate_results(query, results, limit)
 
             def _annotate_gate(stats: List[Dict[str, Any]]) -> None:
@@ -576,6 +590,65 @@ class RAGService:
         except Exception as e:
             self.logger.error(f"検索中にエラーが発生しました: {str(e)}")
             raise
+
+    def _extract_priority_keywords(self, query: str) -> List[str]:
+        lowered = (query or "").lower()
+        hits: List[str] = []
+        for term in self.PRIORITY_KEYWORD_TERMS:
+            if term.lower() in lowered:
+                hits.append(term)
+        return hits
+
+    def _keyword_matches_text(self, text: str, keywords: Sequence[str]) -> List[str]:
+        if not text:
+            return []
+        lowered = text.lower()
+        return [kw for kw in keywords if kw.lower() in lowered]
+
+    def _prepare_keyword_hits(
+        self,
+        hits: List[Dict[str, Any]],
+        keywords: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        if not hits:
+            return hits
+        for idx, hit in enumerate(hits):
+            matches = self._keyword_matches_text(hit.get("content") or "", keywords)
+            meta = dict(hit.get("metadata") or {})
+            meta.setdefault("keyword_match", {})
+            meta["keyword_match"] = {
+                "query_keywords": list(keywords),
+                "matches": matches,
+            }
+            hit["metadata"] = meta
+            base = float(hit.get("similarity") or 0.0)
+            boosted = max(base, self.KEYWORD_SIMILARITY_BASE) + max(
+                0.0, self.KEYWORD_SIMILARITY_BONUS - idx * 0.02
+            )
+            hit["similarity"] = min(0.999, boosted)
+            hit["_keyword_priority"] = True
+        return hits
+
+    def _merge_keyword_hits(
+        self,
+        base_results: List[Dict[str, Any]],
+        keyword_hits: List[Dict[str, Any]],
+        max_candidates: int,
+    ) -> List[Dict[str, Any]]:
+        if not keyword_hits:
+            return base_results
+        merged = list(base_results)
+        seen_ids = {item["document_id"] for item in merged if item.get("document_id")}
+        for hit in keyword_hits:
+            doc_id = hit.get("document_id")
+            if doc_id in seen_ids:
+                continue
+            merged.append(hit)
+            if doc_id:
+                seen_ids.add(doc_id)
+            if len(merged) >= max_candidates:
+                break
+        return merged
 
     def clear_index(self) -> Dict[str, Any]:
         """
@@ -880,3 +953,11 @@ class RAGService:
     FALLBACK_SEARCH_MULTIPLIER = float(os.getenv("RETRIEVAL_FALLBACK_SEARCH_MULTIPLIER", "2.0"))
     FALLBACK_SEARCH_MAX = int(os.getenv("RETRIEVAL_FALLBACK_SEARCH_MAX", "50"))
     PRIMARY_SEARCH_CANDIDATES = int(os.getenv("RETRIEVAL_PRIMARY_CANDIDATES", "20"))
+    PRIORITY_KEYWORD_TERMS = tuple(
+        term.strip()
+        for term in os.getenv("RETRIEVAL_PRIORITY_KEYWORDS", "ゼロショットプロンプト,ゼロショット,zero-shot,zero shot").split(",")
+        if term.strip()
+    )
+    KEYWORD_SEARCH_LIMIT = int(os.getenv("RETRIEVAL_KEYWORD_SEARCH_LIMIT", "10"))
+    KEYWORD_SIMILARITY_BASE = float(os.getenv("RETRIEVAL_KEYWORD_SIM_BASE", "0.72"))
+    KEYWORD_SIMILARITY_BONUS = float(os.getenv("RETRIEVAL_KEYWORD_SIM_BONUS", "0.18"))

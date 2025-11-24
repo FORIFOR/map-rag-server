@@ -12,6 +12,7 @@ from .document_processor import DocumentProcessor
 from .embedding_generator import EmbeddingGenerator
 from .vector_database import VectorDatabase
 from .rag_service import RAGService
+from .pgvector_bootstrap import ensure_pgvector_available
 
 from dotenv import load_dotenv
 
@@ -387,6 +388,8 @@ def create_rag_service_from_env() -> RAGService:
     Returns:
         RAGサービスのインスタンス
     """
+    ensure_pgvector_available()
+
     # 環境変数から接続情報を取得
     postgres_host = os.environ.get("POSTGRES_HOST", "localhost")
     postgres_port = os.environ.get("POSTGRES_PORT", "5432")
